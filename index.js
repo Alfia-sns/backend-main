@@ -1,9 +1,8 @@
 const express = require('express');
 const app = express();
-const axios = require('axios');
-const cheerio = require('cheerio');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 
 // Inisialisasi cloud storage
 const cors = require('cors');
@@ -15,11 +14,8 @@ const bucketName = 'storyverse-app.appspot.com';
 const datasetFilename = 'dataset.csv';
 const datasetBucket = storage.bucket(bucketName);
 const datasetFile = datasetBucket.file(datasetFilename);
-const uploadFotoFolder = 'Upload_foto/';
-const uploadStoriesFolder = 'Upload_stories/';
-const fotoBucket = storage.bucket(bucketName).file(uploadFotoFolder);
-const storiesBucket = storage.bucket(bucketName).file(uploadStoriesFolder);
 
+// Inisialisasi Firebase Admin SDK
 const admin = require('firebase-admin');
 const serviceAccount = require('./serviceAccountKey.json');
 
@@ -31,6 +27,31 @@ const db = admin.firestore();
 
 app.use(express.json());
 app.use(cors());
+
+// Konfigurasi multer untuk upload foto
+const uploadFoto = multer({
+    limits: { fileSize: 50000 }, // Batasan ukuran file: 50KB
+    storage: multer.diskStorage({
+        destination: function (req, file, cb) {
+            cb(null, 'Upload_foto/');
+        },
+        filename: function (req, file, cb) {
+            cb(null, file.originalname);
+        }
+    })
+});
+
+// Konfigurasi multer untuk upload stories
+const uploadStories = multer({
+    storage: multer.diskStorage({
+        destination: function (req, file, cb) {
+            cb(null, 'Upload_stories/');
+        },
+        filename: function (req, file, cb) {
+            cb(null, file.originalname.replace(path.extname(file.originalname), '.txt'));
+        }
+    })
+});
 
 // API endpoint untuk user register
 app.post('/api/register', async (req, res) => {
@@ -100,7 +121,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-
 // API endpoint untuk cloud storage
 app.get('/api/dataset', async (req, res) => {
     try {
@@ -114,24 +134,10 @@ app.get('/api/dataset', async (req, res) => {
 
         stream
             .pipe(csv())
-            .on('data', async (data) => {
+            .on('data', (data) => {
                 const { Title, Created_date, Author, Url, Category } = data;
                 const id = uuid.v4();
-
-                // Mengambil konten artikel dari URL menjadi teks
-                try {
-                    const response = await axios.get(Url);
-                    const $ = cheerio.load(response.data);
-                    const article = $('article').text();
-
-                    // Mendapatkan nama file foto berdasarkan kategori
-                    const categoryCoverImage = `${Category.replace(/\s/g, '_')}.jpg`;
-
-                    dataset.push({ id, Title, Created_date, Author, Url, article, Category, CategoryCoverImage });
-                } catch (error) {
-                    console.error('Error fetching URL:', Url);
-                    console.error(error);
-                }
+                dataset.push({ id, Title, Created_date, Author, Url, Category });
             })
             .on('end', () => {
                 // Return the dataset as a response
@@ -147,142 +153,50 @@ app.get('/api/dataset', async (req, res) => {
     }
 });
 
-// API endpoint untuk mendapatkan data berdasarkan ID
-app.get('/api/dataset/:id', (req, res) => {
-    const { id } = req.params;
+// API endpoint untuk upload foto
+app.post('/api/upload/foto', uploadFoto.single('foto'), async (req, res) => {
+    const foto = req.file;
 
-    // Melakukan pencarian dataset berdasarkan ID
-    const stream = datasetFile.createReadStream();
-    const csv = require('csv-parser');
-    let found = false;
-
-    stream
-        .pipe(csv())
-        .on('data', (data) => {
-            const { Title, Created_date, Author, Url, Category } = data;
-
-            // Jika ID dataset cocok, kirim respons
-            if (data.id === id) {
-                found = true;
-                res.json({ id, Title, Created_date, Author, Url, Category });
-                stream.destroy();
-            }
-        })
-        .on('end', () => {
-            // Jika ID dataset tidak ditemukan, kirim respons error
-            if (!found) {
-                res.status(404).json({ error: 'Dataset not found' });
-            }
-        })
-        .on('error', (err) => {
-            console.error(err);
-            res.status(500).json({ error: 'Internal Server Error' });
-        });
-});
-
-// API endpoint untuk mendapatkan data berdasarkan kategori
-app.get('/api/dataset/category/:category', (req, res) => {
-    const { category } = req.params;
-
-    // Melakukan pencarian dataset berdasarkan kategori
-    const stream = datasetFile.createReadStream();
-    const csv = require('csv-parser');
-    const datasets = [];
-
-    stream
-        .pipe(csv())
-        .on('data', (data) => {
-            const { Title, Created_date, Author, Url, Category } = data;
-
-            // Jika kategori dataset cocok, tambahkan ke daftar dataset
-            if (Category.toLowerCase() === category.toLowerCase()) {
-                datasets.push({ Title, Created_date, Author, Url, Category });
-            }
-        })
-        .on('end', () => {
-            // Kirim daftar dataset berdasarkan kategori sebagai respons
-            res.json(datasets);
-        })
-        .on('error', (err) => {
-            console.error(err);
-            res.status(500).json({ error: 'Internal Server Error' });
-        });
-});
-
-// Konfigurasi multer untuk upload file
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: {
-        fileSize: 50000, // batasan ukuran file (50 KB)
-    },
-    fileFilter: (req, file, cb) => {
-        // batasan format file (hanya jpg/png)
-        const allowedFileTypes = /jpeg|jpg|png/;
-        const extname = allowedFileTypes.test(
-            path.extname(file.originalname).toLowerCase()
-        );
-        const mimetype = allowedFileTypes.test(file.mimetype);
-        if (extname && mimetype) {
-            cb(null, true);
-        } else {
-            cb(new Error('Only JPEG and PNG file formats are allowed'));
+    // Validasi ukuran foto
+    if (!foto || foto.size > 50000) {
+        // Hapus foto yang sudah diupload jika melebihi batasan ukuran
+        if (foto) {
+            fs.unlinkSync(foto.path);
         }
-    },
-});
-
-
-// API endpoint untuk upload foto sampul
-app.post('/api/upload/foto', upload.single('foto'), (req, res, next) => {
-    if (!req.file) {
-        return res
-            .status(400)
-            .json({ error: true, message: 'No file uploaded' });
+        return res.status(400).json({ error: true, message: 'Invalid foto' });
     }
 
-    const file = fotoBucket.file(req.file.originalname);
-    const blobStream = file.createWriteStream();
-
-    blobStream.on('error', (err) => {
-        console.error(err);
-        return res
-            .status(500)
-            .json({ error: true, message: 'Failed to upload photo' });
+    // Menyimpan foto ke cloud storage
+    const bucket = storage.bucket(bucketName);
+    const fotoFile = bucket.file(`Upload_foto/${foto.originalname}`);
+    await fotoFile.save(foto.buffer, {
+        contentType: foto.mimetype,
+        resumable: false
     });
 
-    blobStream.on('finish', () => {
-        return res
-            .status(200)
-            .json({ error: false, message: 'Photo uploaded successfully' });
-    });
-
-    blobStream.end(req.file.buffer);
+    // Respon sukses
+    res.status(200).json({ error: false, message: 'Foto uploaded successfully' });
 });
 
-// API endpoint untuk upload cerita
-app.post('/api/upload/stories', upload.single('file'), (req, res, next) => {
-    if (!req.file) {
-        return res
-            .status(400)
-            .json({ error: true, message: 'No file uploaded' });
+// API endpoint untuk upload stories
+app.post('/api/upload/stories', uploadStories.single('stories'), async (req, res) => {
+    const stories = req.file;
+
+    // Validasi stories
+    if (!stories) {
+        return res.status(400).json({ error: true, message: 'Invalid stories' });
     }
 
-    const file = storiesBucket.file(req.file.originalname);
-    const blobStream = file.createWriteStream();
-
-    blobStream.on('error', (err) => {
-        console.error(err);
-        return res
-            .status(500)
-            .json({ error: true, message: 'Failed to upload story' });
+    // Menyimpan stories ke cloud storage
+    const bucket = storage.bucket(bucketName);
+    const storiesFile = bucket.file(`Upload_stories/${path.basename(stories.originalname, path.extname(stories.originalname))}.txt`);
+    await storiesFile.save(stories.buffer, {
+        contentType: 'text/plain',
+        resumable: false
     });
 
-    blobStream.on('finish', () => {
-        return res
-            .status(200)
-            .json({ error: false, message: 'Story uploaded successfully' });
-    });
-
-    blobStream.end(req.file.buffer);
+    // Respon sukses
+    res.status(200).json({ error: false, message: 'Stories uploaded successfully' });
 });
 
 const port = process.env.PORT || 8080;
